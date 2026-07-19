@@ -27,56 +27,37 @@ cargo run --release -- --once
 ## Quick start
 
 ```bash
+# Interactive setup (interface + router password)
+mywifistats setup
+
 # Live dashboard
 mywifistats
 
-# One-shot tables
+# One-shot tables / JSON / diagnose
 mywifistats --once
-
-# JSON snapshot
 mywifistats --json
-
-# Diagnose
 mywifistats doctor
 ```
 
-## Router credentials (ZTE F670L)
+## Setup TUI
 
-Your gateway was detected as a **ZTE F670LV9.0**. With credentials, the tool can list clients the router knows about (more complete than ARP alone).
+Run **`mywifistats setup`**, or press **`c`** inside the dashboard.
+
+You can set:
+
+- Wireless interface (or leave auto)
+- Router on/off, URL, username, password
+- Test login before saving
+
+Config is written to `~/.config/mywifistats/config.toml` (mode `0600`).
 
 ```bash
-# Write sample config
-mywifistats init-config
-
-# Preferred: password via env
+# Or password via env only (not stored)
 export MYWIFISTATS_ROUTER_PASSWORD='your-router-password'
 mywifistats
 ```
 
-Config file: `~/.config/mywifistats/config.toml`
-
-```toml
-# interface = "wlan0"
-
-[router]
-enabled = true
-base_url = "http://192.168.1.1"
-username = "admin"
-backend = "zte_f670l"
-# password = "..."   # optional; prefer env
-```
-
-Env overrides:
-
-| Variable | Purpose |
-|----------|---------|
-| `MYWIFISTATS_ROUTER_PASSWORD` | Router password |
-| `MYWIFISTATS_ROUTER_USER` | Username |
-| `MYWIFISTATS_ROUTER_URL` | Base URL |
-| `MYWIFISTATS_INTERFACE` | Wireless interface |
-| `MYWIFISTATS_ROUTER_ENABLED` | `true` / `false` |
-
-Disable router for a run: `mywifistats --no-router`.
+Env overrides: `MYWIFISTATS_ROUTER_PASSWORD`, `MYWIFISTATS_ROUTER_USER`, `MYWIFISTATS_ROUTER_URL`, `MYWIFISTATS_INTERFACE`, `MYWIFISTATS_ROUTER_ENABLED`.
 
 ## TUI keys
 
@@ -85,6 +66,7 @@ Disable router for a run: `mywifistats --no-router`.
 | `q` / Esc | Quit |
 | `r` | Refresh now |
 | `s` | Cycle sort |
+| `c` | Open setup |
 | `j` / `↓` | Next row |
 | `k` / `↑` | Previous row |
 | `?` | Help |

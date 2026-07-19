@@ -37,6 +37,20 @@ impl Collector {
         })
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Apply a new config (e.g. after setup TUI) and reset the router session.
+    pub fn reconfigure(&mut self, config: Config) -> Result<()> {
+        let preferred = config.interface.as_deref();
+        self.iface = wifi::detect_interface(preferred)?;
+        self.config = config;
+        self.router = None;
+        self.router_init_attempted = false;
+        Ok(())
+    }
+
     fn ensure_router(&mut self) {
         if self.no_router || !self.config.router.enabled {
             return;
@@ -272,6 +286,9 @@ impl Collector {
             "Config: {}",
             crate::config::Config::config_path().display()
         ));
+        if self.config.needs_setup_hint() {
+            lines.push("Hint: run `mywifistats setup` or press c in the TUI to add router password.".into());
+        }
         lines.join("\n")
     }
 }

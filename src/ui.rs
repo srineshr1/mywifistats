@@ -1,7 +1,9 @@
 use crate::collect::{sort_devices, Collector};
+use crate::config::Config;
 use crate::model::{
-    format_bps, format_bytes, format_duration, NetworkSnapshot, SortKey,
+    format_bps, format_bytes, format_duration, NetworkSnapshot, SortKey, WifiLink,
 };
+use crate::setup;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -69,7 +71,13 @@ fn run_loop(
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if show_help {
+                            show_help = false;
+                        } else {
+                            break;
+                        }
+                    }
                     KeyCode::Char('r') => {
                         snap = collector.collect();
                         sort_devices(&mut snap.devices, sort);
@@ -78,6 +86,29 @@ fn run_loop(
                     KeyCode::Char('s') => {
                         sort = sort.next();
                         sort_devices(&mut snap.devices, sort);
+                    }
+                    KeyCode::Char('c') => {
+                        // Leave alt screen for nested setup? Setup uses its own alt screen.
+                        // Temporarily tear down, run setup, restore.
+                        disable_raw_mode()?;
+                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                        terminal.show_cursor()?;
+
+                        let cfg = collector.config().clone();
+                        let saved = setup::run_setup(&cfg)?;
+
+                        enable_raw_mode()?;
+                        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                        terminal.clear()?;
+
+                        if saved {
+                            if let Ok(new_cfg) = Config::load() {
+                                let _ = collector.reconfigure(new_cfg);
+                            }
+                        }
+                        snap = collector.collect();
+                        sort_devices(&mut snap.devices, sort);
+                        last = Instant::now();
                     }
                     KeyCode::Char('?') | KeyCode::Char('h') => {
                         show_help = !show_help;
@@ -106,35 +137,81 @@ fn draw_dashboard(
     sort: SortKey,
     table_state: &mut TableState,
 ) {
-    let chunks = Layout::default()
+    let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
-            Constraint::Min(5),
-            Constraint::Length(2),
+            Constraint::Length(9), // top cards
+            Constraint::Length(3), // router strip
+            Constraint::Min(6),    // devices
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
-    draw_header(chunks[0], f, snap);
-    draw_devices(chunks[1], f, snap, sort, table_state);
-    draw_footer(chunks[2], f, snap, sort);
+    draw_top_cards(root[0], f, snap);
+    draw_router_strip(root[1], f, snap);
+    draw_devices(root[2], f, snap, sort, table_state);
+    draw_footer(root[3], f, snap, sort);
 }
 
-fn draw_header(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot) {
-    let mut lines = Vec::new();
-    if let Some(w) = &snap.wifi {
-        let ssid = w.ssid.as_deref().unwrap_or("(disconnected)");
+fn draw_top_cards(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+
+    draw_wifi_card(cols[0], f, snap.wifi.as_ref());
+    draw_traffic_card(cols[1], f, snap);
+}
+
+fn signal_bars(dbm: Option<i32>) -> (&'static str, Color) {
+    let Some(s) = dbm else {
+        return ("····", Color::DarkGray);
+    };
+    // Typical WiFi: -30 excellent … -90 unusable
+    if s >= -50 {
+        ("████", Color::Green)
+    } else if s >= -60 {
+        ("███·", Color::Green)
+    } else if s >= -70 {
+        ("██··", Color::Yellow)
+    } else if s >= -80 {
+        ("█···", Color::Red)
+    } else {
+        ("····", Color::Red)
+    }
+}
+
+fn draw_wifi_card(area: Rect, f: &mut ratatui::Frame, wifi: Option<&WifiLink>) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " WiFi link ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line> = if let Some(w) = wifi {
+        let ssid = w
+            .ssid
+            .clone()
+            .unwrap_or_else(|| "(disconnected)".into());
+        let (bars, bar_color) = signal_bars(w.signal_dbm);
         let sig = w
             .signal_dbm
             .map(|s| format!("{s} dBm"))
-            .unwrap_or_else(|| "-".into());
-        let ch = match (w.channel, w.channel_width_mhz) {
-            (Some(c), Some(width)) => format!("ch {c} ({width} MHz)"),
-            (Some(c), None) => format!("ch {c}"),
-            _ => "-".into(),
+            .unwrap_or_else(|| "n/a".into());
+        let ch = match (w.channel, w.channel_width_mhz, w.freq_mhz) {
+            (Some(c), Some(width), Some(freq)) => format!("{c} · {width} MHz · {freq} MHz"),
+            (Some(c), Some(width), None) => format!("{c} · {width} MHz"),
+            (Some(c), _, _) => format!("{c}"),
+            _ => "n/a".into(),
         };
         let br = format!(
-            "↓{}/↑{} Mbit/s",
+            "↓ {}  ↑ {} Mbit/s",
             w.rx_bitrate_mbps
                 .map(|b| format!("{b:.0}"))
                 .unwrap_or_else(|| "-".into()),
@@ -142,79 +219,168 @@ fn draw_header(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot) {
                 .map(|b| format!("{b:.0}"))
                 .unwrap_or_else(|| "-".into()),
         );
-        lines.push(Line::from(vec![
-            Span::styled(
-                " WiFi ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(ssid, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(format!(
-                "  {}  signal {}  {}  {}",
-                w.iface, sig, ch, br
-            )),
-        ]));
-        lines.push(Line::from(format!(
-            "  BSSID {}  IP {}  GW {}  up {}",
-            w.bssid.as_deref().unwrap_or("-"),
+        let addr = format!(
+            "{}  →  {}",
             w.ip.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
             w.gateway
                 .map(|i| i.to_string())
                 .unwrap_or_else(|| "-".into()),
+        );
+        let bssid = format!(
+            "{}  ·  up {}",
+            w.bssid.as_deref().unwrap_or("-"),
             w.connected_secs
                 .map(format_duration)
                 .unwrap_or_else(|| "-".into()),
-        )));
+        );
+        let iface = w.iface.clone();
+        vec![
+            kv_line_owned("SSID", ssid, Color::Cyan),
+            Line::from(vec![
+                Span::styled("  Signal   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{bars} "), Style::default().fg(bar_color)),
+                Span::styled(sig, Style::default().fg(Color::White)),
+                Span::styled(format!("  ·  {iface}"), Style::default().fg(Color::DarkGray)),
+            ]),
+            kv_line_owned("Channel", ch, Color::White),
+            kv_line_owned("Bitrate", br, Color::White),
+            kv_line_owned("Address", addr, Color::White),
+            kv_line_owned("BSSID", bssid, Color::DarkGray),
+        ]
     } else {
-        lines.push(Line::from(" WiFi: no link info"));
-    }
-
-    lines.push(Line::from(vec![
-        Span::styled(" Traffic ", Style::default().fg(Color::Black).bg(Color::Green)),
-        Span::raw(format!(
-            "  live ↓{}  ↑{}   total ↓{}  ↑{}",
-            format_bps(snap.local_rates.rx_bps),
-            format_bps(snap.local_rates.tx_bps),
-            format_bytes(snap.local_traffic.rx_bytes),
-            format_bytes(snap.local_traffic.tx_bytes),
-        )),
-    ]));
-
-    let router_color = if snap.router.connected {
-        Color::Green
-    } else if snap.router.enabled {
-        Color::Yellow
-    } else {
-        Color::DarkGray
+        vec![Line::from(Span::styled(
+            "  No WiFi link info",
+            Style::default().fg(Color::Red),
+        ))]
     };
-    lines.push(Line::from(vec![
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_traffic_card(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(Span::styled(
+            " Traffic · this machine ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Live      ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↓ ", Style::default().fg(Color::Green)),
+            Span::styled(
+                format_bps(snap.local_rates.rx_bps),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("            ", Style::default()),
+            Span::styled("↑ ", Style::default().fg(Color::Magenta)),
+            Span::styled(
+                format_bps(snap.local_rates.tx_bps),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Total     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↓ ", Style::default().fg(Color::Green)),
+            Span::styled(
+                format_bytes(snap.local_traffic.rx_bytes),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("            ", Style::default()),
+            Span::styled("↑ ", Style::default().fg(Color::Magenta)),
+            Span::styled(
+                format_bytes(snap.local_traffic.tx_bytes),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_router_strip(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot) {
+    let (badge_bg, badge_fg, badge) = if snap.router.connected {
+        (Color::Green, Color::Black, " ONLINE ")
+    } else if !snap.router.enabled {
+        (Color::DarkGray, Color::White, " OFF ")
+    } else if snap.router.message.contains("no password")
+        || snap.router.message.contains("not connected")
+    {
+        (Color::Yellow, Color::Black, " SETUP ")
+    } else {
+        (Color::Red, Color::White, " ERROR ")
+    };
+
+    let mut spans = vec![
         Span::styled(
             " Router ",
-            Style::default().fg(Color::Black).bg(router_color),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            "  {} — {}",
+        Span::raw(" "),
+        Span::styled(badge, Style::default().fg(badge_fg).bg(badge_bg)),
+        Span::raw("  "),
+        Span::styled(
             snap.router.name.as_deref().unwrap_or("none"),
-            snap.router.message
-        )),
-    ]));
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&snap.router.message, Style::default().fg(Color::Gray)),
+    ];
 
-    if !snap.errors.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  ! {}", snap.errors[0]),
-            Style::default().fg(Color::Red),
-        )));
+    if !snap.router.connected && snap.router.enabled {
+        spans.push(Span::styled(
+            "  →  press c for setup",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if snap.router.connected {
+        spans.push(Span::styled(
+            format!("  ·  {} clients", snap.router.device_count),
+            Style::default().fg(Color::Green),
+        ));
     }
 
-    let p = Paragraph::new(lines).block(
+    if !snap.errors.is_empty() {
+        spans.push(Span::styled(
+            format!("  ! {}", snap.errors[0]),
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    let p = Paragraph::new(Line::from(spans)).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" mywifistats "),
+            .border_style(Style::default().fg(Color::DarkGray)),
     );
     f.render_widget(p, area);
+}
+
+fn kv_line_owned(key: &str, value: String, value_color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {key:<8} "), Style::default().fg(Color::DarkGray)),
+        Span::styled(value, Style::default().fg(value_color)),
+    ])
 }
 
 fn draw_devices(
@@ -231,9 +397,11 @@ fn draw_devices(
         Cell::from("MAC"),
         Cell::from("Vendor"),
         Cell::from("Link"),
-        Cell::from("Status"),
-        Cell::from("Data ↓/↑"),
-        Cell::from("Rate ↓/↑"),
+        Cell::from("State"),
+        Cell::from("↓ Data"),
+        Cell::from("↑ Data"),
+        Cell::from("↓ Rate"),
+        Cell::from("↑ Rate"),
     ])
     .style(
         Style::default()
@@ -244,24 +412,15 @@ fn draw_devices(
 
     let rows = snap.devices.iter().enumerate().map(|(i, d)| {
         let name = {
-            let mut n = d.hostname.clone().unwrap_or_else(|| "-".into());
+            let base = d.hostname.clone().unwrap_or_else(|| "—".into());
             if d.is_self {
-                n = format!("{n} *");
+                format!("★ {base}")
             } else if d.is_gateway {
-                n = format!("{n} (gw)");
+                format!("⌂ {base}")
+            } else {
+                base
             }
-            n
         };
-        let data = match (d.bytes_rx, d.bytes_tx) {
-            (Some(rx), Some(tx)) => format!("{}/{}", format_bytes(rx), format_bytes(tx)),
-            (Some(rx), None) => format!("{} / -", format_bytes(rx)),
-            _ => "-".into(),
-        };
-        let rate = match (d.rate_rx_bps, d.rate_tx_bps) {
-            (Some(rx), Some(tx)) => format!("{}/{}", format_bps(rx), format_bps(tx)),
-            _ => "-".into(),
-        };
-        let status = if d.online { "up" } else { "stale" };
         let style = if d.is_self {
             Style::default().fg(Color::Cyan)
         } else if !d.online {
@@ -269,82 +428,160 @@ fn draw_devices(
         } else {
             Style::default().fg(Color::Green)
         };
+
+        let state = if d.online { "online" } else { "stale" };
+        let state_cell = Cell::from(state).style(if d.online {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+
         Row::new(vec![
             Cell::from(format!("{}", i + 1)),
             Cell::from(name),
-            Cell::from(d.ip.map(|i| i.to_string()).unwrap_or_else(|| "-".into())),
-            Cell::from(d.mac.clone().unwrap_or_else(|| "-".into())),
-            Cell::from(d.vendor.clone().unwrap_or_else(|| "-".into())),
+            Cell::from(d.ip.map(|i| i.to_string()).unwrap_or_else(|| "—".into())),
+            Cell::from(d.mac.clone().unwrap_or_else(|| "—".into())),
+            Cell::from(d.vendor.clone().unwrap_or_else(|| "—".into())),
             Cell::from(d.link.as_str()),
-            Cell::from(status),
-            Cell::from(data),
-            Cell::from(rate),
+            state_cell,
+            Cell::from(
+                d.bytes_rx
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            Cell::from(
+                d.bytes_tx
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            Cell::from(
+                d.rate_rx_bps
+                    .map(format_bps)
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            Cell::from(
+                d.rate_tx_bps
+                    .map(format_bps)
+                    .unwrap_or_else(|| "—".into()),
+            ),
         ])
         .style(style)
     });
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Length(18),
-            Constraint::Length(15),
-            Constraint::Length(18),
-            Constraint::Length(14),
-            Constraint::Length(5),
-            Constraint::Length(6),
-            Constraint::Length(18),
-            Constraint::Length(18),
-        ],
-    )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL).title(format!(
-        " Devices ({}) · sort: {} ",
-        snap.devices.len(),
-        sort.label()
-    )))
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol(">> ");
+    let widths = [
+        Constraint::Length(3),
+        Constraint::Length(16),
+        Constraint::Length(15),
+        Constraint::Length(18),
+        Constraint::Length(12),
+        Constraint::Length(5),
+        Constraint::Length(7),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    format!(
+                        " Devices ({})  ·  sort: {} ",
+                        snap.devices.len(),
+                        sort.label()
+                    ),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 40, 50))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(" │ ");
 
     f.render_stateful_widget(table, area, table_state);
 }
 
 fn draw_footer(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot, sort: SortKey) {
-    let text = format!(
-        " q quit  r refresh  s sort ({})  ↑↓ move  ? help  ·  {} device(s)",
-        sort.label(),
-        snap.devices.len()
-    );
-    let p = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(p, area);
+    let mut spans = Vec::new();
+    for (key, label) in [
+        ("q", "quit"),
+        ("r", "refresh"),
+        ("s", "sort"),
+        ("c", "setup"),
+        ("↑↓", "move"),
+        ("?", "help"),
+    ] {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default().fg(Color::Black).bg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}  "),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(
+            "· sort={} · {} device(s)",
+            sort.label(),
+            snap.devices.len()
+        ),
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_help(area: Rect, f: &mut ratatui::Frame) {
     let text = vec![
-        Line::from("mywifistats help"),
+        Line::from(Span::styled(
+            "mywifistats help",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
-        Line::from("q / Esc   Quit"),
-        Line::from("r         Refresh now"),
-        Line::from("s         Cycle sort (hostname → ip → mac → usage → link)"),
-        Line::from("j / ↓     Next device"),
-        Line::from("k / ↑     Previous device"),
-        Line::from("? / h     Toggle this help"),
+        Line::from("  q / Esc     Quit (or close help)"),
+        Line::from("  r           Refresh snapshot now"),
+        Line::from("  s           Cycle sort (hostname → ip → mac → usage → link)"),
+        Line::from("  c           Open setup (interface + router credentials)"),
+        Line::from("  j / ↓       Next device"),
+        Line::from("  k / ↑       Previous device"),
+        Line::from("  ? / h       Toggle this help"),
         Line::from(""),
-        Line::from("Data sources:"),
-        Line::from("  • Local WiFi via iw + /sys stats (this machine traffic)"),
-        Line::from("  • LAN neighbors via ip neigh (IP/MAC/status)"),
-        Line::from("  • Router (ZTE F670L) when credentials configured"),
+        Line::from(Span::styled(
+            "Data sources",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from("  • Local WiFi  — iw + interface stats (this machine traffic)"),
+        Line::from("  • LAN         — ip neigh (IP / MAC / vendor)"),
+        Line::from("  • Router      — ZTE F670L admin API when configured"),
         Line::from(""),
-        Line::from("Config: ~/.config/mywifistats/config.toml"),
-        Line::from("Env:    MYWIFISTATS_ROUTER_PASSWORD"),
+        Line::from(Span::styled("Setup", Style::default().fg(Color::Yellow))),
+        Line::from("  mywifistats setup     or press c in the dashboard"),
+        Line::from(format!(
+            "  Config: {}",
+            Config::config_path().display()
+        )),
         Line::from(""),
-        Line::from("Press ? to return"),
+        Line::from(Span::styled(
+            "Press ? to return",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
-    let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Help "));
+    let p = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Help "),
+    );
     f.render_widget(p, area);
 }
 
@@ -401,28 +638,18 @@ pub fn print_once(snap: &NetworkSnapshot) {
         format_bytes(snap.local_traffic.rx_bytes),
         format_bytes(snap.local_traffic.tx_bytes)
     );
-    println!(
-        "\n=== Router: {} ===",
-        snap.router.message
-    );
+    println!("\n=== Router: {} ===", snap.router.message);
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec![
-        "#", "Hostname", "IP", "MAC", "Vendor", "Link", "Status", "Data ↓/↑", "Rate ↓/↑",
+        "#", "Hostname", "IP", "MAC", "Vendor", "Link", "State", "↓ Data", "↑ Data", "↓ Rate",
+        "↑ Rate",
     ]);
     for (i, d) in snap.devices.iter().enumerate() {
         let mut name = d.hostname.clone().unwrap_or_else(|| "-".into());
         if d.is_self {
             name.push_str(" *");
         }
-        let data = match (d.bytes_rx, d.bytes_tx) {
-            (Some(rx), Some(tx)) => format!("{}/{}", format_bytes(rx), format_bytes(tx)),
-            _ => "-".into(),
-        };
-        let rate = match (d.rate_rx_bps, d.rate_tx_bps) {
-            (Some(rx), Some(tx)) => format!("{}/{}", format_bps(rx), format_bps(tx)),
-            _ => "-".into(),
-        };
         table.add_row(vec![
             (i + 1).to_string(),
             name,
@@ -430,9 +657,19 @@ pub fn print_once(snap: &NetworkSnapshot) {
             d.mac.clone().unwrap_or_else(|| "-".into()),
             d.vendor.clone().unwrap_or_else(|| "-".into()),
             d.link.as_str().to_string(),
-            if d.online { "up" } else { "stale" }.into(),
-            data,
-            rate,
+            if d.online { "online" } else { "stale" }.into(),
+            d.bytes_rx
+                .map(format_bytes)
+                .unwrap_or_else(|| "-".into()),
+            d.bytes_tx
+                .map(format_bytes)
+                .unwrap_or_else(|| "-".into()),
+            d.rate_rx_bps
+                .map(format_bps)
+                .unwrap_or_else(|| "-".into()),
+            d.rate_tx_bps
+                .map(format_bps)
+                .unwrap_or_else(|| "-".into()),
         ]);
     }
     println!("\n{table}");

@@ -35,6 +35,8 @@ pub struct Cli {
 pub enum Commands {
     /// Diagnose interface, gateway, and router connectivity.
     Doctor,
+    /// Interactive setup TUI (interface + router credentials).
+    Setup,
     /// Write a sample config file to ~/.config/mywifistats/config.toml
     InitConfig {
         /// Overwrite existing config.
