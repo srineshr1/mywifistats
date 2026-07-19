@@ -58,11 +58,31 @@ pub struct Device {
     pub online: bool,
     pub is_self: bool,
     pub is_gateway: bool,
+    /// True if MAC appears on the router firewall block list.
+    pub blocked: bool,
     pub bytes_rx: Option<u64>,
     pub bytes_tx: Option<u64>,
     pub rate_rx_bps: Option<u64>,
     pub rate_tx_bps: Option<u64>,
     pub source: DeviceSource,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockedDevice {
+    /// Router instance id (e.g. DEV.FW.CHAIN1.MACF1) for unblock.
+    pub inst_id: String,
+    pub name: String,
+    pub mac: String,
+    pub protocol: Option<String>,
+    pub filter_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MacFilterStatus {
+    pub enabled: bool,
+    /// e.g. "Discard" = blacklist, "Accept" = whitelist
+    pub mode: String,
+    pub can_block: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -81,6 +101,7 @@ pub struct RouterStatus {
     pub connected: bool,
     pub device_count: usize,
     pub per_host_traffic: bool,
+    pub can_block: bool,
     pub message: String,
 }
 
@@ -92,6 +113,8 @@ pub struct NetworkSnapshot {
     pub local_traffic: TrafficCounters,
     pub local_rates: TrafficRates,
     pub devices: Vec<Device>,
+    pub blocked: Vec<BlockedDevice>,
+    pub mac_filter: MacFilterStatus,
     pub router: RouterStatus,
     pub errors: Vec<String>,
 }
@@ -115,6 +138,8 @@ impl NetworkSnapshot {
             local_traffic: TrafficCounters::default(),
             local_rates: TrafficRates::default(),
             devices: Vec::new(),
+            blocked: Vec::new(),
+            mac_filter: MacFilterStatus::default(),
             router: RouterStatus::default(),
             errors: Vec::new(),
         }

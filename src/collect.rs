@@ -7,7 +7,7 @@ use crate::rate::RateTracker;
 use crate::router::zte_f670l::ZteF670l;
 use crate::router::RouterBackend;
 use crate::wifi;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::SystemTime;
@@ -138,6 +138,7 @@ impl Collector {
             connected: false,
             device_count: 0,
             per_host_traffic: false,
+            can_block: false,
             message: if self.no_router {
                 "disabled (--no-router)".into()
             } else if !self.config.router.enabled {
@@ -168,11 +169,41 @@ impl Collector {
                         router_status.connected = true;
                         router_status.device_count = router_devices.len();
                         router_status.per_host_traffic = caps.per_host_traffic;
+                        router_status.can_block = caps.can_block;
                         router_status.message = caps.message;
                     }
                     Err(e) => {
                         router_status.message = format!("device list failed: {e}");
                         snap.errors.push(format!("router devices: {e}"));
+                    }
+                }
+                match r.list_blocked() {
+                    Ok(blocked) => {
+                        let n = blocked.len();
+                        snap.blocked = blocked;
+                        router_status.can_block = true;
+                        router_status.message = format!(
+                            "login OK · {} client(s) · {} blocked · rates: this PC only",
+                            router_status.device_count, n
+                        );
+                    }
+                    Err(e) => {
+                        snap.errors.push(format!("blocked list: {e}"));
+                    }
+                }
+                match r.mac_filter_status() {
+                    Ok(st) => {
+                        router_status.can_block = st.can_block || router_status.can_block;
+                        snap.mac_filter = st;
+                    }
+                    Err(_) => {
+                        // Infer from blocked list if global status fails
+                        if !snap.blocked.is_empty() {
+                            snap.mac_filter.enabled = true;
+                            snap.mac_filter.mode = "Discard".into();
+                            snap.mac_filter.can_block = true;
+                            router_status.can_block = true;
+                        }
                     }
                 }
             } else {
@@ -184,6 +215,17 @@ impl Collector {
         }
 
         snap.devices = merge_devices(lan_devices, router_devices, gateway, self_mac.as_deref());
+
+        // Mark blocked from MAC filter list
+        let blocked_macs: std::collections::HashSet<String> =
+            snap.blocked.iter().map(|b| b.mac.clone()).collect();
+        for d in &mut snap.devices {
+            if let Some(m) = &d.mac {
+                if blocked_macs.contains(m) {
+                    d.blocked = true;
+                }
+            }
+        }
 
         // Rate sample for devices with counters
         for d in &mut snap.devices {
@@ -201,6 +243,51 @@ impl Collector {
         snap.router = router_status;
         sort_devices(&mut snap.devices, SortKey::Hostname);
         snap
+    }
+
+    /// Block selected device by MAC via router. Returns status message.
+    pub fn block_device(&mut self, mac: &str, name: &str) -> Result<String> {
+        self.ensure_router();
+        let Some(r) = self.router.as_mut() else {
+            anyhow::bail!("router not available — configure password in setup");
+        };
+        if !r.is_logged_in() {
+            r.login()?;
+        }
+        r.block_device(mac, name)?;
+        Ok(format!("Blocked {name} ({mac}) on router firewall"))
+    }
+
+    /// Unblock by router instance id.
+    pub fn unblock_device(&mut self, inst_id: &str) -> Result<String> {
+        self.ensure_router();
+        let Some(r) = self.router.as_mut() else {
+            anyhow::bail!("router not available — configure password in setup");
+        };
+        if !r.is_logged_in() {
+            r.login()?;
+        }
+        r.unblock_device(inst_id)?;
+        Ok(format!("Unblocked rule {inst_id}"))
+    }
+
+    /// Unblock by MAC (looks up inst id).
+    pub fn unblock_mac(&mut self, mac: &str) -> Result<String> {
+        let mac = normalize_mac(mac).context("invalid MAC")?;
+        self.ensure_router();
+        let Some(r) = self.router.as_mut() else {
+            anyhow::bail!("router not available");
+        };
+        if !r.is_logged_in() {
+            r.login()?;
+        }
+        let list = r.list_blocked()?;
+        let rule = list
+            .into_iter()
+            .find(|b| b.mac == mac)
+            .with_context(|| format!("no block rule for {mac}"))?;
+        r.unblock_device(&rule.inst_id)?;
+        Ok(format!("Unblocked {} ({})", rule.name, mac))
     }
 
     pub fn doctor_report(&mut self) -> String {
@@ -269,13 +356,27 @@ impl Collector {
             snap.devices.len()
         ));
         lines.push(format!(
-            "Router: enabled={}  connected={}  name={}  per-host-traffic={}",
+            "Router: enabled={}  connected={}  name={}  per-host-traffic={}  can-block={}",
             snap.router.enabled,
             snap.router.connected,
             snap.router.name.as_deref().unwrap_or("-"),
             snap.router.per_host_traffic,
+            snap.router.can_block,
         ));
         lines.push(format!("  {}", snap.router.message));
+        lines.push(format!(
+            "MAC filter: enabled={}  mode={}  blocked={}",
+            snap.mac_filter.enabled,
+            snap.mac_filter.mode,
+            snap.blocked.len()
+        ));
+        for b in &snap.blocked {
+            lines.push(format!("  - {}  {}  ({})", b.name, b.mac, b.inst_id));
+        }
+        lines.push(
+            "Note: per-device data rates are only available for this PC; the ZTE firmware does not expose other clients' traffic counters."
+                .into(),
+        );
         if !snap.errors.is_empty() {
             lines.push("Errors:".into());
             for e in &snap.errors {
@@ -287,7 +388,9 @@ impl Collector {
             crate::config::Config::config_path().display()
         ));
         if self.config.needs_setup_hint() {
-            lines.push("Hint: run `mywifistats setup` or press c in the TUI to add router password.".into());
+            lines.push(
+                "Hint: run `mywifistats setup` or press c in the TUI to add router password.".into(),
+            );
         }
         lines.join("\n")
     }
@@ -342,6 +445,7 @@ fn merge_devices(
             if existing.vendor.is_none() {
                 existing.vendor = r.vendor;
             }
+            existing.blocked = existing.blocked || r.blocked;
             existing.source = DeviceSource::Merged;
         } else {
             map.insert(k, r);

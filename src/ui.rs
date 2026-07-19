@@ -34,6 +34,12 @@ pub fn run_tui(collector: &mut Collector, interval_ms: u64) -> Result<()> {
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Devices,
+    Blocked,
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     collector: &mut Collector,
@@ -46,9 +52,12 @@ fn run_loop(
     let mut table_state = TableState::default();
     table_state.select(Some(0));
     let mut show_help = false;
+    let mut view = ViewMode::Devices;
+    let mut status_msg: Option<(String, bool)> = None; // message, is_error
+    let mut confirm_block: Option<usize> = None; // pending device index
 
     loop {
-        if last.elapsed() >= tick {
+        if last.elapsed() >= tick && confirm_block.is_none() {
             snap = collector.collect();
             sort_devices(&mut snap.devices, sort);
             last = Instant::now();
@@ -58,7 +67,16 @@ fn run_loop(
             if show_help {
                 draw_help(f.area(), f);
             } else {
-                draw_dashboard(f.area(), f, &snap, sort, &mut table_state);
+                draw_dashboard(
+                    f.area(),
+                    f,
+                    &snap,
+                    sort,
+                    &mut table_state,
+                    view,
+                    status_msg.as_ref(),
+                    confirm_block,
+                );
             }
         })?;
 
@@ -70,6 +88,45 @@ fn run_loop(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+
+                // Confirm dialog for block
+                if let Some(idx) = confirm_block {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            confirm_block = None;
+                            if let Some(dev) = snap.devices.get(idx) {
+                                if dev.is_self {
+                                    status_msg =
+                                        Some(("Cannot block this machine".into(), true));
+                                } else if let Some(mac) = &dev.mac {
+                                    let name = dev
+                                        .hostname
+                                        .clone()
+                                        .unwrap_or_else(|| "device".into());
+                                    match collector.block_device(mac, &name) {
+                                        Ok(msg) => {
+                                            status_msg = Some((msg, false));
+                                            snap = collector.collect();
+                                            sort_devices(&mut snap.devices, sort);
+                                        }
+                                        Err(e) => status_msg = Some((format!("{e}"), true)),
+                                    }
+                                } else {
+                                    status_msg =
+                                        Some(("Device has no MAC address".into(), true));
+                                }
+                            }
+                            last = Instant::now();
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            confirm_block = None;
+                            status_msg = Some(("Block cancelled".into(), false));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
                         if show_help {
@@ -82,14 +139,53 @@ fn run_loop(
                         snap = collector.collect();
                         sort_devices(&mut snap.devices, sort);
                         last = Instant::now();
+                        status_msg = Some(("Refreshed".into(), false));
                     }
-                    KeyCode::Char('s') => {
+                    KeyCode::Char('s') if view == ViewMode::Devices => {
                         sort = sort.next();
                         sort_devices(&mut snap.devices, sort);
                     }
+                    KeyCode::Char('b') | KeyCode::Tab => {
+                        view = match view {
+                            ViewMode::Devices => ViewMode::Blocked,
+                            ViewMode::Blocked => ViewMode::Devices,
+                        };
+                        table_state.select(Some(0));
+                        status_msg = None;
+                    }
+                    KeyCode::Char('x') if view == ViewMode::Devices => {
+                        if !snap.router.can_block && !snap.router.connected {
+                            status_msg = Some((
+                                "Block needs router login — press c for setup".into(),
+                                true,
+                            ));
+                        } else if let Some(i) = table_state.selected() {
+                            confirm_block = Some(i);
+                        }
+                    }
+                    KeyCode::Char('u') if view == ViewMode::Blocked => {
+                        if let Some(i) = table_state.selected() {
+                            if let Some(rule) = snap.blocked.get(i) {
+                                match collector.unblock_device(&rule.inst_id) {
+                                    Ok(msg) => {
+                                        status_msg = Some((msg, false));
+                                        snap = collector.collect();
+                                        sort_devices(&mut snap.devices, sort);
+                                        if snap.blocked.is_empty() {
+                                            table_state.select(Some(0));
+                                        } else {
+                                            let max = snap.blocked.len().saturating_sub(1);
+                                            table_state
+                                                .select(Some(i.min(max)));
+                                        }
+                                    }
+                                    Err(e) => status_msg = Some((format!("{e}"), true)),
+                                }
+                                last = Instant::now();
+                            }
+                        }
+                    }
                     KeyCode::Char('c') => {
-                        // Leave alt screen for nested setup? Setup uses its own alt screen.
-                        // Temporarily tear down, run setup, restore.
                         disable_raw_mode()?;
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                         terminal.show_cursor()?;
@@ -115,7 +211,10 @@ fn run_loop(
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let i = table_state.selected().unwrap_or(0);
-                        let max = snap.devices.len().saturating_sub(1);
+                        let max = match view {
+                            ViewMode::Devices => snap.devices.len().saturating_sub(1),
+                            ViewMode::Blocked => snap.blocked.len().saturating_sub(1),
+                        };
                         table_state.select(Some((i + 1).min(max)));
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -136,21 +235,94 @@ fn draw_dashboard(
     snap: &NetworkSnapshot,
     sort: SortKey,
     table_state: &mut TableState,
+    view: ViewMode,
+    status_msg: Option<&(String, bool)>,
+    confirm_block: Option<usize>,
 ) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(9), // top cards
             Constraint::Length(3), // router strip
-            Constraint::Min(6),    // devices
+            Constraint::Length(if status_msg.is_some() || confirm_block.is_some() {
+                3
+            } else {
+                0
+            }),
+            Constraint::Min(6), // devices / blocked
             Constraint::Length(1), // footer
         ])
         .split(area);
 
     draw_top_cards(root[0], f, snap);
     draw_router_strip(root[1], f, snap);
-    draw_devices(root[2], f, snap, sort, table_state);
-    draw_footer(root[3], f, snap, sort);
+    if confirm_block.is_some() || status_msg.is_some() {
+        draw_status_bar(root[2], f, snap, status_msg, confirm_block);
+    }
+    match view {
+        ViewMode::Devices => draw_devices(root[3], f, snap, sort, table_state),
+        ViewMode::Blocked => draw_blocked(root[3], f, snap, table_state),
+    }
+    draw_footer(root[4], f, snap, sort, view);
+}
+
+fn draw_status_bar(
+    area: Rect,
+    f: &mut ratatui::Frame,
+    snap: &NetworkSnapshot,
+    status_msg: Option<&(String, bool)>,
+    confirm_block: Option<usize>,
+) {
+    let line = if let Some(idx) = confirm_block {
+        let name = snap
+            .devices
+            .get(idx)
+            .and_then(|d| d.hostname.clone())
+            .unwrap_or_else(|| "device".into());
+        let mac = snap
+            .devices
+            .get(idx)
+            .and_then(|d| d.mac.clone())
+            .unwrap_or_else(|| "?".into());
+        Line::from(vec![
+            Span::styled(
+                " CONFIRM ",
+                Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  Block {name} ({mac}) on router?  "),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(" y ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::raw(" yes  "),
+            Span::styled(" n ", Style::default().fg(Color::Black).bg(Color::DarkGray)),
+            Span::raw(" no"),
+        ])
+    } else if let Some((msg, err)) = status_msg {
+        Line::from(vec![
+            Span::styled(
+                if *err { " ERROR " } else { " OK " },
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(if *err { Color::Red } else { Color::Green }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                msg.as_str(),
+                Style::default().fg(if *err { Color::Red } else { Color::Green }),
+            ),
+        ])
+    } else {
+        Line::from("")
+    };
+    f.render_widget(
+        Paragraph::new(line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        area,
+    );
 }
 
 fn draw_top_cards(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot) {
@@ -356,9 +528,19 @@ fn draw_router_strip(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot)
         ));
     } else if snap.router.connected {
         spans.push(Span::styled(
-            format!("  ·  {} clients", snap.router.device_count),
+            format!(
+                "  ·  {} clients  ·  {} blocked",
+                snap.router.device_count,
+                snap.blocked.len()
+            ),
             Style::default().fg(Color::Green),
         ));
+        if !snap.router.per_host_traffic {
+            spans.push(Span::styled(
+                "  ·  rates: this PC only",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
 
     if !snap.errors.is_empty() {
@@ -417,11 +599,15 @@ fn draw_devices(
                 format!("★ {base}")
             } else if d.is_gateway {
                 format!("⌂ {base}")
+            } else if d.blocked {
+                format!("⊘ {base}")
             } else {
                 base
             }
         };
-        let style = if d.is_self {
+        let style = if d.blocked {
+            Style::default().fg(Color::Red)
+        } else if d.is_self {
             Style::default().fg(Color::Cyan)
         } else if !d.online {
             Style::default().fg(Color::DarkGray)
@@ -429,13 +615,23 @@ fn draw_devices(
             Style::default().fg(Color::Green)
         };
 
-        let state = if d.online { "online" } else { "stale" };
-        let state_cell = Cell::from(state).style(if d.online {
+        let state = if d.blocked {
+            "blocked"
+        } else if d.online {
+            "online"
+        } else {
+            "stale"
+        };
+        let state_cell = Cell::from(state).style(if d.blocked {
+            Style::default().fg(Color::Red)
+        } else if d.online {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::DarkGray)
         });
 
+        // Rates only for this machine (and any device with counters)
+        let rate_na = "n/a";
         Row::new(vec![
             Cell::from(format!("{}", i + 1)),
             Cell::from(name),
@@ -447,22 +643,22 @@ fn draw_devices(
             Cell::from(
                 d.bytes_rx
                     .map(format_bytes)
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| if d.is_self { "—".into() } else { rate_na.into() }),
             ),
             Cell::from(
                 d.bytes_tx
                     .map(format_bytes)
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| if d.is_self { "—".into() } else { rate_na.into() }),
             ),
             Cell::from(
                 d.rate_rx_bps
                     .map(format_bps)
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| if d.is_self { "—".into() } else { rate_na.into() }),
             ),
             Cell::from(
                 d.rate_tx_bps
                     .map(format_bps)
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| if d.is_self { "—".into() } else { rate_na.into() }),
             ),
         ])
         .style(style)
@@ -475,13 +671,18 @@ fn draw_devices(
         Constraint::Length(18),
         Constraint::Length(12),
         Constraint::Length(5),
-        Constraint::Length(7),
+        Constraint::Length(8),
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(10),
     ];
 
+    let note = if snap.router.per_host_traffic {
+        ""
+    } else {
+        "  ·  n/a rates = not exposed by router"
+    };
     let table = Table::new(rows, widths)
         .header(header)
         .block(
@@ -490,9 +691,10 @@ fn draw_devices(
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title(Span::styled(
                     format!(
-                        " Devices ({})  ·  sort: {} ",
+                        " Devices ({})  ·  sort: {}{} ",
                         snap.devices.len(),
-                        sort.label()
+                        sort.label(),
+                        note
                     ),
                     Style::default()
                         .fg(Color::White)
@@ -509,16 +711,132 @@ fn draw_devices(
     f.render_stateful_widget(table, area, table_state);
 }
 
-fn draw_footer(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot, sort: SortKey) {
+fn draw_blocked(
+    area: Rect,
+    f: &mut ratatui::Frame,
+    snap: &NetworkSnapshot,
+    table_state: &mut TableState,
+) {
+    let header = Row::new(vec![
+        Cell::from("#"),
+        Cell::from("Name"),
+        Cell::from("MAC"),
+        Cell::from("Protocol"),
+        Cell::from("Type"),
+        Cell::from("Rule ID"),
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .height(1);
+
+    let mode = if snap.mac_filter.mode.is_empty() {
+        "—".into()
+    } else {
+        snap.mac_filter.mode.clone()
+    };
+    let title = format!(
+        " Blocked devices ({})  ·  filter {}  ·  mode: {} ",
+        snap.blocked.len(),
+        if snap.mac_filter.enabled {
+            "ON"
+        } else {
+            "OFF"
+        },
+        mode
+    );
+
+    let rows = if snap.blocked.is_empty() {
+        vec![Row::new(vec![
+            Cell::from(""),
+            Cell::from("No blocked devices"),
+            Cell::from("—"),
+            Cell::from("—"),
+            Cell::from("—"),
+            Cell::from("press b to go back · x on a device to block"),
+        ])
+        .style(Style::default().fg(Color::DarkGray))]
+    } else {
+        snap.blocked
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                Row::new(vec![
+                    Cell::from(format!("{}", i + 1)),
+                    Cell::from(b.name.clone()),
+                    Cell::from(b.mac.clone()),
+                    Cell::from(b.protocol.clone().unwrap_or_else(|| "—".into())),
+                    Cell::from(b.filter_type.clone().unwrap_or_else(|| "—".into())),
+                    Cell::from(b.inst_id.clone()),
+                ])
+                .style(Style::default().fg(Color::Red))
+            })
+            .collect()
+    };
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(3),
+            Constraint::Length(18),
+            Constraint::Length(18),
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Min(16),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red))
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            )),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Rgb(50, 30, 30))
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol(" │ ");
+
+    f.render_stateful_widget(table, area, table_state);
+}
+
+fn draw_footer(
+    area: Rect,
+    f: &mut ratatui::Frame,
+    snap: &NetworkSnapshot,
+    sort: SortKey,
+    view: ViewMode,
+) {
     let mut spans = Vec::new();
-    for (key, label) in [
-        ("q", "quit"),
-        ("r", "refresh"),
-        ("s", "sort"),
-        ("c", "setup"),
-        ("↑↓", "move"),
-        ("?", "help"),
-    ] {
+    let keys: &[(&str, &str)] = match view {
+        ViewMode::Devices => &[
+            ("q", "quit"),
+            ("r", "refresh"),
+            ("s", "sort"),
+            ("x", "block"),
+            ("b", "blocked"),
+            ("c", "setup"),
+            ("?", "help"),
+        ],
+        ViewMode::Blocked => &[
+            ("q", "quit"),
+            ("r", "refresh"),
+            ("u", "unblock"),
+            ("b", "devices"),
+            ("c", "setup"),
+            ("?", "help"),
+        ],
+    };
+    for (key, label) in keys {
         spans.push(Span::styled(
             format!(" {key} "),
             Style::default().fg(Color::Black).bg(Color::DarkGray),
@@ -530,9 +848,13 @@ fn draw_footer(area: Rect, f: &mut ratatui::Frame, snap: &NetworkSnapshot, sort:
     }
     spans.push(Span::styled(
         format!(
-            "· sort={} · {} device(s)",
-            sort.label(),
-            snap.devices.len()
+            "· {} · {} online · {} blocked",
+            match view {
+                ViewMode::Devices => format!("sort={}", sort.label()),
+                ViewMode::Blocked => "blocked list".into(),
+            },
+            snap.devices.len(),
+            snap.blocked.len()
         ),
         Style::default().fg(Color::DarkGray),
     ));
@@ -550,26 +872,29 @@ fn draw_help(area: Rect, f: &mut ratatui::Frame) {
         Line::from(""),
         Line::from("  q / Esc     Quit (or close help)"),
         Line::from("  r           Refresh snapshot now"),
-        Line::from("  s           Cycle sort (hostname → ip → mac → usage → link)"),
+        Line::from("  s           Cycle sort (devices view)"),
+        Line::from("  b / Tab     Toggle Devices ↔ Blocked list"),
+        Line::from("  x           Block selected device (router MAC filter)"),
+        Line::from("  u           Unblock selected rule (blocked view)"),
         Line::from("  c           Open setup (interface + router credentials)"),
-        Line::from("  j / ↓       Next device"),
-        Line::from("  k / ↑       Previous device"),
+        Line::from("  j / ↓       Next row"),
+        Line::from("  k / ↑       Previous row"),
         Line::from("  ? / h       Toggle this help"),
         Line::from(""),
         Line::from(Span::styled(
-            "Data sources",
+            "Why other devices show n/a for rates",
             Style::default().fg(Color::Yellow),
         )),
-        Line::from("  • Local WiFi  — iw + interface stats (this machine traffic)"),
-        Line::from("  • LAN         — ip neigh (IP / MAC / vendor)"),
-        Line::from("  • Router      — ZTE F670L admin API when configured"),
+        Line::from("  Your laptop is a WiFi client — only the router sees every"),
+        Line::from("  device's packets. This ZTE firmware exposes the client list"),
+        Line::from("  (name/IP/MAC) and MAC filter, but NOT per-host byte counters."),
+        Line::from("  Live ↓/↑ for ★ this machine comes from local interface stats."),
         Line::from(""),
-        Line::from(Span::styled("Setup", Style::default().fg(Color::Yellow))),
-        Line::from("  mywifistats setup     or press c in the dashboard"),
-        Line::from(format!(
-            "  Config: {}",
-            Config::config_path().display()
-        )),
+        Line::from(Span::styled("Blocking", Style::default().fg(Color::Yellow))),
+        Line::from("  Uses the router's firewall MAC filter (blacklist mode)."),
+        Line::from("  Requires router login (setup). Cannot block this PC."),
+        Line::from(""),
+        Line::from(format!("  Config: {}", Config::config_path().display())),
         Line::from(""),
         Line::from(Span::styled(
             "Press ? to return",
@@ -639,6 +964,13 @@ pub fn print_once(snap: &NetworkSnapshot) {
         format_bytes(snap.local_traffic.tx_bytes)
     );
     println!("\n=== Router: {} ===", snap.router.message);
+    println!(
+        "MAC filter: {}  mode={}  blocked={}",
+        if snap.mac_filter.enabled { "ON" } else { "OFF" },
+        snap.mac_filter.mode,
+        snap.blocked.len()
+    );
+    println!("Note: per-device rates are only for this PC (router firmware has no per-host traffic).");
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec![
@@ -650,6 +982,10 @@ pub fn print_once(snap: &NetworkSnapshot) {
         if d.is_self {
             name.push_str(" *");
         }
+        if d.blocked {
+            name.push_str(" [blocked]");
+        }
+        let na = if d.is_self { "-" } else { "n/a" };
         table.add_row(vec![
             (i + 1).to_string(),
             name,
@@ -657,22 +993,29 @@ pub fn print_once(snap: &NetworkSnapshot) {
             d.mac.clone().unwrap_or_else(|| "-".into()),
             d.vendor.clone().unwrap_or_else(|| "-".into()),
             d.link.as_str().to_string(),
-            if d.online { "online" } else { "stale" }.into(),
-            d.bytes_rx
-                .map(format_bytes)
-                .unwrap_or_else(|| "-".into()),
-            d.bytes_tx
-                .map(format_bytes)
-                .unwrap_or_else(|| "-".into()),
-            d.rate_rx_bps
-                .map(format_bps)
-                .unwrap_or_else(|| "-".into()),
-            d.rate_tx_bps
-                .map(format_bps)
-                .unwrap_or_else(|| "-".into()),
+            if d.blocked {
+                "blocked"
+            } else if d.online {
+                "online"
+            } else {
+                "stale"
+            }
+            .into(),
+            d.bytes_rx.map(format_bytes).unwrap_or_else(|| na.into()),
+            d.bytes_tx.map(format_bytes).unwrap_or_else(|| na.into()),
+            d.rate_rx_bps.map(format_bps).unwrap_or_else(|| na.into()),
+            d.rate_tx_bps.map(format_bps).unwrap_or_else(|| na.into()),
         ]);
     }
     println!("\n{table}");
+
+    if !snap.blocked.is_empty() {
+        println!("\n=== Blocked ===");
+        for b in &snap.blocked {
+            println!("  {}  {}  ({})", b.name, b.mac, b.inst_id);
+        }
+    }
+
     if !snap.errors.is_empty() {
         println!("\nWarnings:");
         for e in &snap.errors {
