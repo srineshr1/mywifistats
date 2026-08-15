@@ -1,16 +1,22 @@
 use crate::config::Config;
 use crate::lan;
 use crate::model::{
-    normalize_mac, Device, DeviceSource, LinkKind, NetworkSnapshot, RouterStatus, SortKey,
+    normalize_mac, Device, DeviceSource, LinkKind, MacFilterStatus, NetworkSnapshot, RouterStatus,
+    SortKey, WifiLink,
 };
 use crate::rate::RateTracker;
 use crate::router::zte_f670l::ZteF670l;
 use crate::router::RouterBackend;
 use crate::wifi;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+
+/// How often to re-query router / neighbors / full iw scan.
+const SLOW_REFRESH: Duration = Duration::from_secs(6);
+/// How often to refresh the blocked-list page (heavier: menuView ~40KB).
+const BLOCKED_REFRESH: Duration = Duration::from_secs(20);
 
 pub struct Collector {
     iface: String,
@@ -19,6 +25,16 @@ pub struct Collector {
     router: Option<Box<dyn RouterBackend>>,
     router_init_attempted: bool,
     no_router: bool,
+
+    // Caches so the TUI tick stays cheap
+    last_slow: Option<Instant>,
+    last_blocked: Option<Instant>,
+    cached_wifi: Option<WifiLink>,
+    cached_devices: Vec<Device>,
+    cached_blocked: Vec<crate::model::BlockedDevice>,
+    cached_mac_filter: MacFilterStatus,
+    cached_router: RouterStatus,
+    cached_errors: Vec<String>,
 }
 
 impl Collector {
@@ -34,6 +50,14 @@ impl Collector {
             router: None,
             router_init_attempted: false,
             no_router,
+            last_slow: None,
+            last_blocked: None,
+            cached_wifi: None,
+            cached_devices: Vec::new(),
+            cached_blocked: Vec::new(),
+            cached_mac_filter: MacFilterStatus::default(),
+            cached_router: RouterStatus::default(),
+            cached_errors: Vec::new(),
         })
     }
 
@@ -48,7 +72,17 @@ impl Collector {
         self.config = config;
         self.router = None;
         self.router_init_attempted = false;
+        self.last_slow = None;
+        self.last_blocked = None;
+        self.cached_devices.clear();
+        self.cached_blocked.clear();
         Ok(())
+    }
+
+    /// Force a full refresh on the next collect (after block/unblock).
+    pub fn invalidate_cache(&mut self) {
+        self.last_slow = None;
+        self.last_blocked = None;
     }
 
     fn ensure_router(&mut self) {
@@ -76,7 +110,6 @@ impl Collector {
                             self.router = Some(Box::new(z));
                         }
                         Err(_) => {
-                            // Keep for retry message via temporary status
                             self.router = Some(Box::new(z));
                         }
                     },
@@ -89,42 +122,124 @@ impl Collector {
         }
     }
 
+    /// Full snapshot (used by --once / --json / doctor / first TUI frame).
     pub fn collect(&mut self) -> NetworkSnapshot {
+        self.collect_with(true, true)
+    }
+
+    /// TUI tick: always update local traffic; periodically refresh router/LAN.
+    pub fn collect_tick(&mut self) -> NetworkSnapshot {
+        let now = Instant::now();
+        let need_slow = self
+            .last_slow
+            .map(|t| now.duration_since(t) >= SLOW_REFRESH)
+            .unwrap_or(true);
+        let need_blocked = self
+            .last_blocked
+            .map(|t| now.duration_since(t) >= BLOCKED_REFRESH)
+            .unwrap_or(true);
+        self.collect_with(need_slow, need_blocked)
+    }
+
+    fn collect_with(&mut self, refresh_slow: bool, refresh_blocked: bool) -> NetworkSnapshot {
         let mut snap = NetworkSnapshot::empty();
         snap.collected_at = SystemTime::now();
+        let mut errors = Vec::new();
 
-        match wifi::collect_wifi(&self.iface) {
-            Ok(w) => snap.wifi = Some(w),
-            Err(e) => snap.errors.push(format!("wifi: {e}")),
-        }
-
+        // --- Always cheap: interface byte counters ---
         match wifi::read_traffic(&self.iface) {
             Ok(t) => {
                 snap.local_rates = self.rates.update_local(&t);
                 snap.local_traffic = t;
             }
-            Err(e) => snap.errors.push(format!("traffic: {e}")),
+            Err(e) => errors.push(format!("traffic: {e}")),
         }
 
-        let gateway = snap.wifi.as_ref().and_then(|w| w.gateway);
-        let self_ip = snap.wifi.as_ref().and_then(|w| w.ip);
-        let self_mac = wifi::local_mac(&self.iface).and_then(|m| normalize_mac(&m));
+        if refresh_slow {
+            self.refresh_slow(&mut errors);
+            self.last_slow = Some(Instant::now());
+        }
 
-        let mut lan_devices = match lan::discover_neighbors(&self.iface, gateway, self_ip) {
-            Ok(d) => d,
-            Err(e) => {
-                snap.errors.push(format!("lan: {e}"));
-                Vec::new()
-            }
-        };
+        if refresh_blocked && self.router_ready() {
+            self.refresh_blocked(&mut errors);
+            self.last_blocked = Some(Instant::now());
+        }
 
-        // Attach local traffic to self device
-        for d in &mut lan_devices {
+        // Assemble from cache + live traffic
+        snap.wifi = self.cached_wifi.clone();
+        snap.devices = self.cached_devices.clone();
+        snap.blocked = self.cached_blocked.clone();
+        snap.mac_filter = self.cached_mac_filter.clone();
+        snap.router = self.cached_router.clone();
+
+        // Update self-device live rates every tick
+        for d in &mut snap.devices {
             if d.is_self {
                 d.bytes_rx = Some(snap.local_traffic.rx_bytes);
                 d.bytes_tx = Some(snap.local_traffic.tx_bytes);
                 d.rate_rx_bps = Some(snap.local_rates.rx_bps);
                 d.rate_tx_bps = Some(snap.local_rates.tx_bps);
+            }
+        }
+
+        // Mark blocked
+        let blocked_macs: std::collections::HashSet<String> =
+            snap.blocked.iter().map(|b| b.mac.clone()).collect();
+        for d in &mut snap.devices {
+            if let Some(m) = &d.mac {
+                d.blocked = blocked_macs.contains(m);
+            }
+        }
+
+        snap.errors = if refresh_slow || refresh_blocked {
+            self.cached_errors = errors.clone();
+            errors
+        } else {
+            self.cached_errors.clone()
+        };
+
+        // Keep router message in sync with blocked count
+        if snap.router.connected {
+            snap.router.message = format!(
+                "login OK · {} client(s) · {} blocked · rates: this PC only",
+                snap.router.device_count,
+                snap.blocked.len()
+            );
+            snap.router.can_block = snap.mac_filter.can_block || !snap.blocked.is_empty() || snap.router.can_block;
+        }
+
+        sort_devices(&mut snap.devices, SortKey::Hostname);
+        snap
+    }
+
+    fn router_ready(&self) -> bool {
+        self.router
+            .as_ref()
+            .map(|r| r.is_logged_in())
+            .unwrap_or(false)
+    }
+
+    fn refresh_slow(&mut self, errors: &mut Vec<String>) {
+        // One `iw link` is enough for most fields (skip station dump + info on tick path)
+        match wifi::collect_wifi_fast(&self.iface) {
+            Ok(w) => self.cached_wifi = Some(w),
+            Err(e) => errors.push(format!("wifi: {e}")),
+        }
+
+        let gateway = self.cached_wifi.as_ref().and_then(|w| w.gateway);
+        let self_ip = self.cached_wifi.as_ref().and_then(|w| w.ip);
+        let self_mac = wifi::local_mac(&self.iface).and_then(|m| normalize_mac(&m));
+
+        let mut lan_devices = match lan::discover_neighbors(&self.iface, gateway, self_ip) {
+            Ok(d) => d,
+            Err(e) => {
+                errors.push(format!("lan: {e}"));
+                Vec::new()
+            }
+        };
+
+        for d in &mut lan_devices {
+            if d.is_self {
                 d.link = LinkKind::Wifi;
             }
         }
@@ -138,7 +253,7 @@ impl Collector {
             connected: false,
             device_count: 0,
             per_host_traffic: false,
-            can_block: false,
+            can_block: self.cached_router.can_block,
             message: if self.no_router {
                 "disabled (--no-router)".into()
             } else if !self.config.router.enabled {
@@ -157,7 +272,7 @@ impl Collector {
                     Ok(()) => {}
                     Err(e) => {
                         router_status.message = format!("login failed: {e}");
-                        snap.errors.push(format!("router login: {e}"));
+                        errors.push(format!("router login: {e}"));
                     }
                 }
             }
@@ -174,36 +289,7 @@ impl Collector {
                     }
                     Err(e) => {
                         router_status.message = format!("device list failed: {e}");
-                        snap.errors.push(format!("router devices: {e}"));
-                    }
-                }
-                match r.list_blocked() {
-                    Ok(blocked) => {
-                        let n = blocked.len();
-                        snap.blocked = blocked;
-                        router_status.can_block = true;
-                        router_status.message = format!(
-                            "login OK · {} client(s) · {} blocked · rates: this PC only",
-                            router_status.device_count, n
-                        );
-                    }
-                    Err(e) => {
-                        snap.errors.push(format!("blocked list: {e}"));
-                    }
-                }
-                match r.mac_filter_status() {
-                    Ok(st) => {
-                        router_status.can_block = st.can_block || router_status.can_block;
-                        snap.mac_filter = st;
-                    }
-                    Err(_) => {
-                        // Infer from blocked list if global status fails
-                        if !snap.blocked.is_empty() {
-                            snap.mac_filter.enabled = true;
-                            snap.mac_filter.mode = "Discard".into();
-                            snap.mac_filter.can_block = true;
-                            router_status.can_block = true;
-                        }
+                        errors.push(format!("router devices: {e}"));
                     }
                 }
             } else {
@@ -214,35 +300,52 @@ impl Collector {
             }
         }
 
-        snap.devices = merge_devices(lan_devices, router_devices, gateway, self_mac.as_deref());
+        let mut devices = merge_devices(lan_devices, router_devices, gateway, self_mac.as_deref());
+        // Preserve live counters on self if we already have traffic
+        // (filled again in collect_with)
 
-        // Mark blocked from MAC filter list
+        // Keep blocked flags from cache until blocked refresh
         let blocked_macs: std::collections::HashSet<String> =
-            snap.blocked.iter().map(|b| b.mac.clone()).collect();
-        for d in &mut snap.devices {
+            self.cached_blocked.iter().map(|b| b.mac.clone()).collect();
+        for d in &mut devices {
             if let Some(m) = &d.mac {
-                if blocked_macs.contains(m) {
-                    d.blocked = true;
-                }
+                d.blocked = blocked_macs.contains(m);
             }
         }
 
-        // Rate sample for devices with counters
-        for d in &mut snap.devices {
-            if let Some(mac) = &d.mac {
-                let (rx_r, tx_r) = self.rates.update_device(mac, d.bytes_rx, d.bytes_tx);
-                if d.rate_rx_bps.is_none() {
-                    d.rate_rx_bps = rx_r;
+        self.cached_devices = devices;
+        self.cached_router = router_status;
+    }
+
+    fn refresh_blocked(&mut self, errors: &mut Vec<String>) {
+        if let Some(r) = self.router.as_mut() {
+            if !r.is_logged_in() {
+                return;
+            }
+            match r.list_blocked() {
+                Ok(blocked) => {
+                    self.cached_blocked = blocked;
+                    self.cached_router.can_block = true;
                 }
-                if d.rate_tx_bps.is_none() {
-                    d.rate_tx_bps = tx_r;
+                Err(e) => errors.push(format!("blocked list: {e}")),
+            }
+            match r.mac_filter_status() {
+                Ok(st) => {
+                    self.cached_router.can_block = st.can_block || self.cached_router.can_block;
+                    self.cached_mac_filter = st;
+                }
+                Err(_) => {
+                    if !self.cached_blocked.is_empty() {
+                        self.cached_mac_filter.enabled = true;
+                        if self.cached_mac_filter.mode.is_empty() {
+                            self.cached_mac_filter.mode = "Discard".into();
+                        }
+                        self.cached_mac_filter.can_block = true;
+                        self.cached_router.can_block = true;
+                    }
                 }
             }
         }
-
-        snap.router = router_status;
-        sort_devices(&mut snap.devices, SortKey::Hostname);
-        snap
     }
 
     /// Block selected device by MAC via router. Returns status message.
@@ -255,6 +358,7 @@ impl Collector {
             r.login()?;
         }
         r.block_device(mac, name)?;
+        self.invalidate_cache();
         Ok(format!("Blocked {name} ({mac}) on router firewall"))
     }
 
@@ -268,26 +372,8 @@ impl Collector {
             r.login()?;
         }
         r.unblock_device(inst_id)?;
+        self.invalidate_cache();
         Ok(format!("Unblocked rule {inst_id}"))
-    }
-
-    /// Unblock by MAC (looks up inst id).
-    pub fn unblock_mac(&mut self, mac: &str) -> Result<String> {
-        let mac = normalize_mac(mac).context("invalid MAC")?;
-        self.ensure_router();
-        let Some(r) = self.router.as_mut() else {
-            anyhow::bail!("router not available");
-        };
-        if !r.is_logged_in() {
-            r.login()?;
-        }
-        let list = r.list_blocked()?;
-        let rule = list
-            .into_iter()
-            .find(|b| b.mac == mac)
-            .with_context(|| format!("no block rule for {mac}"))?;
-        r.unblock_device(&rule.inst_id)?;
-        Ok(format!("Unblocked {} ({})", rule.name, mac))
     }
 
     pub fn doctor_report(&mut self) -> String {
@@ -402,7 +488,6 @@ fn merge_devices(
     gateway: Option<IpAddr>,
     self_mac: Option<&str>,
 ) -> Vec<Device> {
-    // Key by MAC when possible, else IP
     let mut map: HashMap<String, Device> = HashMap::new();
 
     let key_of = |d: &Device| -> String {
@@ -422,7 +507,6 @@ fn merge_devices(
     for r in router {
         let k = key_of(&r);
         if let Some(existing) = map.get_mut(&k) {
-            // Prefer router hostname / link type
             if r.hostname.is_some() {
                 existing.hostname = r.hostname;
             }
@@ -473,7 +557,6 @@ fn merge_devices(
 
 pub fn sort_devices(devices: &mut [Device], key: SortKey) {
     devices.sort_by(|a, b| {
-        // Self first, then gateway, then rest
         b.is_self
             .cmp(&a.is_self)
             .then(b.is_gateway.cmp(&a.is_gateway))

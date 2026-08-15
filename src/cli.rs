@@ -15,8 +15,9 @@ pub struct Cli {
     #[arg(long)]
     pub json: bool,
 
-    /// Refresh interval in milliseconds (TUI).
-    #[arg(long, default_value_t = 1500)]
+    /// Local traffic refresh interval in milliseconds (TUI).
+    /// Router/LAN data refreshes less often (~6s) so the UI stays snappy.
+    #[arg(long, default_value_t = 1000)]
     pub interval_ms: u64,
 
     /// Wireless interface (overrides config / auto-detect).

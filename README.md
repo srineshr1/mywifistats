@@ -15,14 +15,23 @@ Works as a normal Linux WiFi **client** — no root required for the basics.
 ## Install
 
 ```bash
-cargo install --path .
+# From the project directory — puts binary in ~/.cargo/bin
+cargo install --path . --force
+
+# Ensure cargo bin is on your PATH (add to ~/.zshrc if needed):
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Then:
+mywifistats
 ```
 
-Or run from the repo:
+Or run without installing:
 
 ```bash
+cargo run --release
 cargo run --release -- --once
 ```
+
 
 ## Quick start
 

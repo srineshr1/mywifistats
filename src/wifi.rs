@@ -75,7 +75,20 @@ fn read_u64(path: &str) -> Result<u64> {
         .with_context(|| format!("parsing {path}"))
 }
 
+/// Full wifi probe (`iw link` + `info` + station dump). Use sparingly.
 pub fn collect_wifi(iface: &str) -> Result<WifiLink> {
+    let mut link = collect_wifi_fast(iface)?;
+    if let Ok(out) = run_cmd(&["iw", "dev", iface, "info"]) {
+        parse_iw_info(&out, &mut link);
+    }
+    if let Ok(out) = run_cmd(&["iw", "dev", iface, "station", "dump"]) {
+        parse_station_dump(&out, &mut link);
+    }
+    Ok(link)
+}
+
+/// Faster probe: single `iw link` + IP/gateway (enough for the dashboard).
+pub fn collect_wifi_fast(iface: &str) -> Result<WifiLink> {
     let mut link = WifiLink {
         iface: iface.to_string(),
         ssid: None,
@@ -94,11 +107,12 @@ pub fn collect_wifi(iface: &str) -> Result<WifiLink> {
     if let Ok(out) = run_cmd(&["iw", "dev", iface, "link"]) {
         parse_iw_link(&out, &mut link);
     }
-    if let Ok(out) = run_cmd(&["iw", "dev", iface, "info"]) {
-        parse_iw_info(&out, &mut link);
-    }
-    if let Ok(out) = run_cmd(&["iw", "dev", iface, "station", "dump"]) {
-        parse_station_dump(&out, &mut link);
+
+    // Channel/width often only on `iw info` — one extra call is still cheaper than 3.
+    if link.channel.is_none() {
+        if let Ok(out) = run_cmd(&["iw", "dev", iface, "info"]) {
+            parse_iw_info(&out, &mut link);
+        }
     }
 
     link.ip = primary_ipv4(iface);

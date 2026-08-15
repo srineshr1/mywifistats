@@ -45,8 +45,9 @@ fn run_loop(
     collector: &mut Collector,
     interval_ms: u64,
 ) -> Result<()> {
-    let tick = Duration::from_millis(interval_ms.max(500));
+    let tick = Duration::from_millis(interval_ms.max(400));
     let mut last = Instant::now() - tick;
+    // First frame: full collect (router + devices)
     let mut snap = collector.collect();
     let mut sort = SortKey::Hostname;
     let mut table_state = TableState::default();
@@ -58,7 +59,8 @@ fn run_loop(
 
     loop {
         if last.elapsed() >= tick && confirm_block.is_none() {
-            snap = collector.collect();
+            // Fast tick: local rates always; router/LAN on a slower cadence inside collector
+            snap = collector.collect_tick();
             sort_devices(&mut snap.devices, sort);
             last = Instant::now();
         }
@@ -106,7 +108,7 @@ fn run_loop(
                                     match collector.block_device(mac, &name) {
                                         Ok(msg) => {
                                             status_msg = Some((msg, false));
-                                            snap = collector.collect();
+                                            snap = collector.collect(); // full refresh after block
                                             sort_devices(&mut snap.devices, sort);
                                         }
                                         Err(e) => status_msg = Some((format!("{e}"), true)),
@@ -136,6 +138,7 @@ fn run_loop(
                         }
                     }
                     KeyCode::Char('r') => {
+                        collector.invalidate_cache();
                         snap = collector.collect();
                         sort_devices(&mut snap.devices, sort);
                         last = Instant::now();

@@ -347,9 +347,13 @@ impl ZteF670l {
     }
 
     fn fetch_filter_global(&mut self) -> Result<MacFilterStatus> {
-        // prime already done by list_blocked; still safe to call again
-        let _ = self.prime_filter_menu();
-        let body = self.get_text("/?_type=menuData&_tag=firewall_filterglobal_lua.lua")?;
+        // Assume filter menu already primed by list_blocked / refresh_filter_token.
+        // Only re-prime if the first GET times out.
+        let mut body = self.get_text("/?_type=menuData&_tag=firewall_filterglobal_lua.lua")?;
+        if body.contains("SessionTimeout") {
+            self.prime_filter_menu()?;
+            body = self.get_text("/?_type=menuData&_tag=firewall_filterglobal_lua.lua")?;
+        }
         if body.contains("SessionTimeout") {
             bail!("session timeout fetching filter global");
         }
@@ -365,17 +369,13 @@ impl ZteF670l {
     }
 
     fn probe_capabilities(&mut self) {
+        // Don't hit the heavy filter page on every login — assume block is available
+        // on this firmware and confirm on first blocked-list fetch.
         self.per_host_traffic = false;
-        match self.fetch_blocked_xml() {
-            Ok(_) => self.can_block = true,
-            Err(_) => self.can_block = false,
-        }
+        self.can_block = true;
         if self.logged_in {
-            self.last_message = if self.can_block {
-                "login OK · block supported · no per-host traffic on this firmware".into()
-            } else {
-                "login OK · device list only".into()
-            };
+            self.last_message =
+                "login OK · block supported · no per-host traffic on this firmware".into();
         }
     }
 
